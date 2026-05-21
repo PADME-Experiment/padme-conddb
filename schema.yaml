@@ -1,0 +1,165 @@
+# ======================================================================
+# PADME Conditions Database — Schema Definition
+# ======================================================================
+#
+# This file is the single source of truth for every column in the DB.
+# Edit it by hand to add/remove/rename columns, then rebuild the DB:
+#
+#     python padme_conditions_db.py --build
+#
+# Structure
+# ---------
+# Each top-level key is a "detector group" (shown as a group in the web UI).
+# Under each group, list the columns with their SQL type and an optional
+# description.  The special group "core" holds event identifiers and
+# run-level metadata.
+#
+# Supported SQL types: INTEGER, BIGINT, DOUBLE, VARCHAR, BOOLEAN, …
+# Add "NOT NULL" after the type if the column must always have a value.
+#
+# Column names should be lowercase with underscores (snake_case).
+#
+# The optional "csv_alias" field maps a raw CSV header name (lowercased)
+# to this DB column, used during ingestion.  If omitted the DB column
+# name is used as-is for matching.
+# ======================================================================
+
+core:
+  run_number:
+    type: "INTEGER NOT NULL"
+    description: "Run number"
+  unix_time:
+    type: "BIGINT NOT NULL"
+    description: "Unix timestamp [seconds] — primary key / unique ID"
+  ebeam:
+    type: "DOUBLE"
+    description: "Beam energy [MeV]"
+  sqrt_s:
+    type: "DOUBLE"
+    description: "Centre-of-mass energy [MeV]"
+
+target_charges:
+  q_lg:
+    type: "DOUBLE"
+    description: "Lead-glass charge (from target reco)"
+  err_q_lg:
+    type: "DOUBLE"
+    description: "Error on q_lg"
+  qx_target:
+    type: "DOUBLE"
+    description: "Target charge — X strips"
+  err_qx_target:
+    type: "DOUBLE"
+    description: "Error on qx_target"
+  qy_target:
+    type: "DOUBLE"
+    description: "Target charge — Y strips"
+  err_qy_target:
+    type: "DOUBLE"
+    description: "Error on qy_target"
+  fitted_qx_target:
+    type: "DOUBLE"
+    description: "Fitted target charge — X strips"
+  err_fitted_qx_target:
+    type: "DOUBLE"
+    description: "Error on fitted_qx_target"
+  fitted_qy_target:
+    type: "DOUBLE"
+    description: "Fitted target charge — Y strips"
+  err_fitted_qy_target:
+    type: "DOUBLE"
+    description: "Error on fitted_qy_target"
+
+target_ratios:
+  ratio_qx_target_lg:
+    type: "DOUBLE"
+    description: "qX_Target / q_LG"
+  err_ratio_qx_target_lg:
+    type: "DOUBLE"
+    description: "Error on ratio_qx_target_lg"
+  ratio_qy_target_lg:
+    type: "DOUBLE"
+    description: "qY_Target / q_LG"
+  err_ratio_qy_target_lg:
+    type: "DOUBLE"
+    description: "Error on ratio_qy_target_lg"
+  ratio_fitted_qx_target_lg:
+    type: "DOUBLE"
+    description: "Fitted_qX_Target / q_LG"
+  err_ratio_fitted_qx_target_lg:
+    type: "DOUBLE"
+    description: "Error on ratio_fitted_qx_target_lg"
+  ratio_fitted_qy_target_lg:
+    type: "DOUBLE"
+    description: "Fitted_qY_Target / q_LG"
+  err_ratio_fitted_qy_target_lg:
+    type: "DOUBLE"
+    description: "Error on ratio_fitted_qy_target_lg"
+
+target_ratios_encorr:
+  ratio_qx_target_lg_encorr:
+    type: "DOUBLE"
+    description: "qX_Target / q_LG (energy-corrected)"
+  err_ratio_qx_target_lg_encorr:
+    type: "DOUBLE"
+    description: "Error on ratio_qx_target_lg_encorr"
+  ratio_qy_target_lg_encorr:
+    type: "DOUBLE"
+    description: "qY_Target / q_LG (energy-corrected)"
+  err_ratio_qy_target_lg_encorr:
+    type: "DOUBLE"
+    description: "Error on ratio_qy_target_lg_encorr"
+  ratio_fitted_qx_target_lg_encorr:
+    type: "DOUBLE"
+    description: "Fitted_qX_Target / q_LG (energy-corrected)"
+  err_ratio_fitted_qx_target_lg_encorr:
+    type: "DOUBLE"
+    description: "Error on ratio_fitted_qx_target_lg_encorr"
+  ratio_fitted_qy_target_lg_encorr:
+    type: "DOUBLE"
+    description: "Fitted_qY_Target / q_LG (energy-corrected)"
+  err_ratio_fitted_qy_target_lg_encorr:
+    type: "DOUBLE"
+    description: "Error on ratio_fitted_qy_target_lg_encorr"
+
+target_positions:
+  x_tar:
+    type: "DOUBLE"
+    description: "Beam X position on target [mm]"
+  err_x_tar:
+    type: "DOUBLE"
+    description: "Error on x_tar"
+  y_tar:
+    type: "DOUBLE"
+    description: "Beam Y position on target [mm]"
+  err_y_tar:
+    type: "DOUBLE"
+    description: "Error on y_tar"
+  fitted_x_tar:
+    type: "DOUBLE"
+    description: "Fitted beam X position [mm]"
+  err_fitted_x_tar:
+    type: "DOUBLE"
+    description: "Error on fitted_x_tar"
+  fitted_y_tar:
+    type: "DOUBLE"
+    description: "Fitted beam Y position [mm]"
+  err_fitted_y_tar:
+    type: "DOUBLE"
+    description: "Error on fitted_y_tar"
+  sigmax_tar:
+    type: "DOUBLE"
+    description: "Beam sigma X on target [mm]"
+  err_sigmax_tar:
+    type: "DOUBLE"
+    description: "Error on sigmax_tar"
+
+leadglass:
+  lg_charge:
+    type: "DOUBLE"
+    description: "Lead-glass calorimeter total charge"
+    csv_alias: "lgcharge"
+  lg_charge_rms:
+    type: "DOUBLE"
+    description: "RMS of lead-glass charge"
+    csv_alias: "lgchargerms"

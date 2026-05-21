@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# DuckDB databases
+*.duckdb
+*.duckdb.wal
+
+# macOS
+.DS_Store

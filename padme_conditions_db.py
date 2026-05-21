@@ -203,16 +203,30 @@ def get_conditions(
     tag: str,
     detector: str | None = None,
     quantity: str | None = None,
+    unix_time: int | None = None,
 ) -> list[dict]:
     """
     Return all conditions valid for run_number under tag.
     Optionally narrow by detector and/or quantity.
 
-    A condition row is valid for run_number when:
-        since_run <= run_number AND (until_run IS NULL OR until_run >= run_number)
+    unix_time (optional) — Unix timestamp [seconds] for mid-run precision.
+    When provided, also filters on the wall-clock IoV columns:
+        (valid_since IS NULL OR valid_since <= ts)
+        AND (valid_until IS NULL OR valid_until >= ts)
+    Conditions with no wall-clock IoV set (valid_since/valid_until both NULL)
+    always pass through, so this is fully backward-compatible.
     """
     filters = ["tag = ?", "since_run <= ?", "(until_run IS NULL OR until_run >= ?)"]
     params: list = [tag, run_number, run_number]
+
+    if unix_time is not None:
+        from datetime import datetime, timezone
+        ts = datetime.fromtimestamp(unix_time, tz=timezone.utc)
+        filters += [
+            "(valid_since IS NULL OR valid_since <= ?)",
+            "(valid_until IS NULL OR valid_until >= ?)",
+        ]
+        params += [ts, ts]
 
     if detector:
         filters.append("detector = ?")

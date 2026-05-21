@@ -108,6 +108,48 @@ print(calib[0]["value"], "±", calib[0]["uncertainty"])
 # → 1.042 ± 0.003
 ```
 
+### Mid-run precision with `unix_time`
+
+By default, `get_conditions()` uses run-number IoV only — it returns every
+condition whose `since_run`/`until_run` range covers the requested run,
+regardless of when within the run you're asking about.
+
+Pass `unix_time` to also apply the wall-clock IoV (`valid_since`/`valid_until`).
+This is useful when a condition changed mid-run (e.g. an HV trip that was
+corrected at a known timestamp):
+
+```python
+from datetime import datetime, timezone
+
+# Store a run-scoped condition (no wall-clock IoV — always passes through)
+insert_condition(con, tag="online_v1", detector="leadglass",
+                 quantity="charge_calib_factor",
+                 value=1.000, uncertainty=0.010, unit="a.u.",
+                 since_run=80000)
+
+# Store a mid-run condition: HV correction applied at 14:30 UTC
+insert_condition(con, tag="online_v1", detector="pveto",
+                 quantity="hv_correction",
+                 value=0.95, uncertainty=0.01, unit="a.u.",
+                 since_run=80344, until_run=80344,
+                 valid_since=datetime(2025, 6, 16, 14, 30, tzinfo=timezone.utc),
+                 valid_until=datetime(2025, 6, 16, 23, 59, tzinfo=timezone.utc))
+
+# Query at 14:00 — HV correction not yet valid, only LG calib returned
+t_before = int(datetime(2025, 6, 16, 14,  0, tzinfo=timezone.utc).timestamp())
+get_conditions(con, 80344, "online_v1", unix_time=t_before)
+# → [leadglass/charge_calib_factor]
+
+# Query at 14:30 — both conditions now valid
+t_after = int(datetime(2025, 6, 16, 14, 30, tzinfo=timezone.utc).timestamp())
+get_conditions(con, 80344, "online_v1", unix_time=t_after)
+# → [leadglass/charge_calib_factor, pveto/hv_correction]
+```
+
+**Backward-compatible:** conditions with no `valid_since`/`valid_until` set
+always pass through, so existing run-scoped conditions work unchanged whether
+or not you pass `unix_time`.
+
 ### Versioning — same quantity, different tags
 
 ```python

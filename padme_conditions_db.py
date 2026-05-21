@@ -19,6 +19,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -256,6 +257,196 @@ def insert_monitoring_rows(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Ingestion helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def _to_quantity(raw: str) -> str:
+    """Normalise a CSV column header to a snake_case quantity name."""
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', raw)   # LGCharge → LG_Charge
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)         # qXTarget → q_X_Target
+    return s.lower()
+
+
+def _pair_columns(headers: list[str]) -> dict[str, tuple[str, str | None]]:
+    """
+    Return {csv_col: (quantity_name, err_csv_col_or_None)} for every
+    value column.  Columns whose name starts with 'err_' are recognised
+    as uncertainties and excluded as standalone entries.
+    """
+    lower_to_raw = {h.lower(): h for h in headers}
+    result: dict[str, tuple[str, str | None]] = {}
+    for raw in headers:
+        if raw.lower().startswith("err_"):
+            continue
+        err_raw = lower_to_raw.get("err_" + raw.lower())
+        result[raw] = (_to_quantity(raw), err_raw)
+    return result
+
+
+def _parse_run_meta(line: str) -> dict:
+    """Parse the metadata header line from a target observable file.
+    Example: ' RunNumber = 80344 - EBeam = 293.5 - SqrtS = 17.3193'
+    """
+    meta: dict = {}
+    for pattern, key, cast in [
+        (r"RunNumber\s*=\s*(\d+)",      "run_number",    int),
+        (r"EBeam\s*=\s*([\d.]+)",       "ebeam_nominal", float),
+        (r"SqrtS\s*=\s*([\d.]+)",       "sqrt_s_nominal",float),
+    ]:
+        m = re.search(pattern, line)
+        if m:
+            meta[key] = cast(m.group(1))
+    return meta
+
+
+def ingest_target_file(con: duckdb.DuckDBPyConnection,
+                       filepath: str | Path) -> int:
+    """
+    Ingest one target-observable CSV into the monitoring table.
+
+    File format
+    -----------
+    Line 1  metadata   ' RunNumber = XXXXX - EBeam = YYY - SqrtS = ZZZ'
+    Line 2  CSV header 'UnixTime,q_LG,err_q_LG,qX_Target,err_qX_Target,…'
+    Lines 3+ data rows '1750091156,714.64,1.32,734.35,9.55,…'
+
+    Returns the number of time-slice rows ingested.
+    """
+    filepath = Path(filepath)
+    with open(filepath) as f:
+        meta_line   = f.readline()
+        header_line = f.readline().strip()
+        data_lines  = [l.strip() for l in f if l.strip()]
+
+    meta = _parse_run_meta(meta_line)
+    upsert_run(con, meta["run_number"],
+               ebeam_nominal=meta.get("ebeam_nominal"),
+               sqrt_s_nominal=meta.get("sqrt_s_nominal"))
+
+    headers    = [h.strip() for h in header_line.split(",")]
+    col_index  = {h: i for i, h in enumerate(headers)}
+    time_col   = next(
+        h for h in headers if h.lower() in ("unixtime", "unix_time", "timestamp")
+    )
+    time_idx   = col_index[time_col]
+    pairs      = _pair_columns([h for h in headers if h != time_col])
+
+    monitoring_rows = []
+    for line in data_lines:
+        vals     = line.split(",")
+        unix_time = int(float(vals[time_idx]))
+        for csv_col, (quantity, err_col) in pairs.items():
+            try:
+                value = float(vals[col_index[csv_col]])
+            except (ValueError, IndexError):
+                continue
+            uncertainty = None
+            if err_col:
+                try:
+                    uncertainty = float(vals[col_index[err_col]])
+                except (ValueError, IndexError):
+                    pass
+            monitoring_rows.append(dict(
+                run_number  = meta["run_number"],
+                unix_time   = unix_time,
+                detector    = "target",
+                quantity    = quantity,
+                value       = value,
+                uncertainty = uncertainty,
+                source_file = str(filepath),
+            ))
+
+    insert_monitoring_rows(con, monitoring_rows)
+    return len(data_lines)
+
+
+def ingest_leadglass_file(con: duckdb.DuckDBPyConnection,
+                          filepath: str | Path) -> int:
+    """
+    Ingest one lead-glass observable file into the monitoring table.
+
+    File format (space-separated)
+    ------------------------------
+    Nrun  Nevent  TimeStamp  LGCharge  LGChargeRMS
+    80677  10000  1762641474  688.124  52.0083
+
+    Nevent is a cumulative event counter; n_events per slice is the
+    step between consecutive rows (or the value itself for the first row).
+
+    Returns the number of time-slice rows ingested.
+    """
+    filepath = Path(filepath)
+    with open(filepath) as f:
+        header_line = f.readline().strip()
+        data_lines  = [l.strip() for l in f if l.strip()]
+
+    headers    = header_line.split()
+    lower      = [h.lower() for h in headers]
+    run_idx    = lower.index("nrun")
+    event_idx  = lower.index("nevent")
+    time_idx   = lower.index("timestamp")
+
+    skip = {run_idx, event_idx, time_idx}
+    quantity_cols = [
+        (i, _to_quantity(headers[i]))
+        for i in range(len(headers))
+        if i not in skip
+    ]
+
+    monitoring_rows = []
+    prev_nevent: dict[int, int] = {}
+    seen_runs: set[int] = set()
+
+    for line in data_lines:
+        vals       = line.split()
+        run_number = int(vals[run_idx])
+        nevent     = int(vals[event_idx])
+        unix_time  = int(vals[time_idx])
+        n_events   = nevent - prev_nevent.get(run_number, 0)
+        prev_nevent[run_number] = nevent
+        seen_runs.add(run_number)
+
+        for idx, quantity in quantity_cols:
+            try:
+                value = float(vals[idx])
+            except (ValueError, IndexError):
+                continue
+            monitoring_rows.append(dict(
+                run_number  = run_number,
+                unix_time   = unix_time,
+                detector    = "leadglass",
+                quantity    = quantity,
+                value       = value,
+                n_events    = n_events,
+                source_file = str(filepath),
+            ))
+
+    for run_number in seen_runs:
+        upsert_run(con, run_number)
+
+    insert_monitoring_rows(con, monitoring_rows)
+    return len(data_lines)
+
+
+def ingest_all(con: duckdb.DuckDBPyConnection,
+               base_dir: str | Path = BASE_DIR) -> None:
+    """Discover and ingest all known data files under base_dir."""
+    base_dir = Path(base_dir)
+
+    target_dir = base_dir / "target_observables"
+    if target_dir.is_dir():
+        for f in sorted(target_dir.glob("DB_run_*.txt")):
+            n = ingest_target_file(con, f)
+            print(f"  target    | {f.name:<50s} | {n:>5d} slices")
+
+    lg_dir = base_dir / "leadglass_observables"
+    if lg_dir.is_dir():
+        for f in sorted(lg_dir.glob("*.txt")):
+            n = ingest_leadglass_file(con, f)
+            print(f"  leadglass | {f.name:<50s} | {n:>5d} slices")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Diagnostics
 # ──────────────────────────────────────────────────────────────────────
 
@@ -346,11 +537,13 @@ def main():
                         help="Print a summary of the DB contents")
     parser.add_argument("--shell", action="store_true",
                         help="Open an interactive SQL shell")
+    parser.add_argument("--ingest", action="store_true",
+                        help="Ingest all data files found under the repo directory")
     parser.add_argument("--db", default=DB_FILE,
                         help=f"Path to the DuckDB file (default: {DB_FILE})")
     args = parser.parse_args()
 
-    if not any([args.build, args.check, args.shell]):
+    if not any([args.build, args.check, args.shell, args.ingest]):
         parser.print_help()
         sys.exit(0)
 
@@ -365,6 +558,13 @@ def main():
         con.close()
         size_mb = db_path.stat().st_size / 1024 / 1024
         print(f"Done. {db_path}  ({size_mb:.3f} MB)\n")
+
+    if args.ingest:
+        con = open_db(args.db)
+        print("Ingesting data …")
+        ingest_all(con)
+        print_summary(con)
+        con.close()
 
     if args.check:
         con = duckdb.connect(str(args.db), read_only=True)

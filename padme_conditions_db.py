@@ -2,342 +2,314 @@
 """
 PADME Conditions Database — built on DuckDB.
 
-Creates and manages a single-file columnar database for ~400M physics events.
-All sub-detector observables live in one flat table (`events`).
-New sub-detectors can be added later by appending columns.
+Four tables driven by schema.yaml:
+  runs        — immutable per-run metadata
+  tags        — named condition snapshots (versioning)
+  conditions  — IoV-scoped, versioned scalar conditions
+  monitoring  — dense time-series observables (EAV layout)
 
 Usage
 -----
-    # Build the DB from the example CSV files shipped with this repo
-    python padme_conditions_db.py --build
-
-    # Interactive DuckDB shell on the resulting file
-    python padme_conditions_db.py --shell
-
-    # Run a quick sanity check
-    python padme_conditions_db.py --check
+    python padme_conditions_db.py --build          # create/migrate tables
+    python padme_conditions_db.py --check          # print summary
+    python padme_conditions_db.py --shell          # interactive SQL shell
+    python padme_conditions_db.py --fresh --build  # wipe and rebuild from scratch
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
-import os
-import re
 import sys
 from pathlib import Path
 
 import duckdb
 import yaml
 
-# ──────────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────────
 DB_FILE = "padme_conditions.duckdb"
 BASE_DIR = Path(__file__).resolve().parent
 SCHEMA_FILE = BASE_DIR / "schema.yaml"
 
+
 # ──────────────────────────────────────────────────────────────────────
-# Schema loading from schema.yaml
+# Schema loading
 # ──────────────────────────────────────────────────────────────────────
 
 def load_schema(schema_path: str | Path = SCHEMA_FILE) -> dict:
-    """
-    Load and return the raw schema dict from the YAML file.
-    Top-level keys are detector groups; each group maps column names to
-    dicts with at least a 'type' key.
-    """
-    with open(schema_path, "r") as f:
+    with open(schema_path) as f:
         return yaml.safe_load(f)
 
 
-def schema_to_flat_columns(schema: dict) -> dict[str, str]:
-    """
-    Flatten the grouped schema into an ordered dict of
-    column_name → SQL type (e.g. "DOUBLE", "INTEGER NOT NULL").
-    """
-    flat: dict[str, str] = {}
-    for group_name, columns in schema.items():
-        for col_name, col_info in columns.items():
-            flat[col_name] = col_info["type"]
-    return flat
-
-
-def schema_to_groups(schema: dict) -> dict[str, list[str]]:
-    """
-    Return {group_label → [col_name, …]} preserving YAML order.
-    Group labels are prettified from the YAML key (underscores → spaces,
-    title-cased).
-    """
-    groups: dict[str, list[str]] = {}
-    for group_key, columns in schema.items():
-        label = group_key.replace("_", " ").title()
-        groups[label] = list(columns.keys())
-    return groups
-
-
-def schema_to_csv_alias_map(schema: dict) -> dict[str, str]:
-    """
-    Build a lowercased CSV-header → DB-column mapping.
-    Uses the 'csv_alias' field if present, otherwise the column name itself.
-    """
-    mapping: dict[str, str] = {}
-    for columns in schema.values():
-        for col_name, col_info in columns.items():
-            alias = col_info.get("csv_alias", col_name).lower()
-            mapping[alias] = col_name
-    return mapping
-
-
 # ──────────────────────────────────────────────────────────────────────
-# Database creation
+# Table creation
 # ──────────────────────────────────────────────────────────────────────
 
-def create_database(db_path: str | Path = DB_FILE,
-                    schema_path: str | Path = SCHEMA_FILE) -> duckdb.DuckDBPyConnection:
-    """Create (or open) the DuckDB database and ensure the events table exists."""
-    con = duckdb.connect(str(db_path))
+def _build_col_sql(col_name: str, col_info: dict, sequences: list[str]) -> str:
+    col_type = col_info["type"]
+    parts = [col_name, col_type]
 
-    schema = load_schema(schema_path)
-    all_columns = schema_to_flat_columns(schema)
+    if col_info.get("auto_increment"):
+        seq = f"seq_{col_name}"
+        sequences.append(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1;")
+        parts.append(f"DEFAULT nextval('{seq}')")
 
-    cols_sql = ",\n    ".join(f"{col} {dtype}" for col, dtype in all_columns.items())
-    con.execute(f"""
-        CREATE TABLE IF NOT EXISTS events (
-            {cols_sql}
-        );
-    """)
+    elif "default" in col_info:
+        parts.append(f"DEFAULT {col_info['default']}")
 
-    # Index on unix_time (the unique row identifier) for fast lookups.
-    # DuckDB uses ART indexes; safe to call IF NOT EXISTS.
-    con.execute("""
-        CREATE INDEX IF NOT EXISTS idx_unix_time
-        ON events (unix_time);
-    """)
+    return " ".join(parts)
 
+
+def create_tables(con: duckdb.DuckDBPyConnection, schema: dict) -> None:
+    for table_name, table_def in schema.get("tables", {}).items():
+        columns = table_def.get("columns", {})
+        sequences: list[str] = []
+        col_defs: list[str] = []
+        pk_cols: list[str] = []
+        fk_defs: list[str] = []
+
+        for col_name, col_info in columns.items():
+            col_defs.append(_build_col_sql(col_name, col_info, sequences))
+            if col_info.get("primary_key"):
+                pk_cols.append(col_name)
+            if fk := col_info.get("fk"):
+                ref_table, ref_col = fk.split(".")
+                fk_defs.append(
+                    f"FOREIGN KEY ({col_name}) REFERENCES {ref_table}({ref_col})"
+                )
+
+        if pk_cols:
+            col_defs.append(f"PRIMARY KEY ({', '.join(pk_cols)})")
+        col_defs.extend(fk_defs)
+
+        for seq_sql in sequences:
+            con.execute(seq_sql)
+
+        con.execute(
+            f"CREATE TABLE IF NOT EXISTS {table_name} (\n    "
+            + ",\n    ".join(col_defs)
+            + "\n);"
+        )
+
+        for col_name, col_info in columns.items():
+            if col_info.get("index"):
+                con.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}_{col_name} "
+                    f"ON {table_name} ({col_name});"
+                )
+
+        print(f"  table ready: {table_name}")
+
+
+def open_db(
+    db_path: str | Path = DB_FILE,
+    schema_path: str | Path = SCHEMA_FILE,
+    read_only: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(str(db_path), read_only=read_only)
+    if not read_only:
+        create_tables(con, load_schema(schema_path))
     return con
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Ingestion helpers
+# runs helpers
 # ──────────────────────────────────────────────────────────────────────
 
-# The CSV-to-DB mapping is built dynamically from schema.yaml.
-# Extra aliases for CSV headers that don't match the DB column name
-# (and aren't covered by the 'csv_alias' field in the YAML) go here:
-_EXTRA_CSV_ALIASES = {
-    "unixtime":  "unix_time",
-    "nrun":      "run_number",
-    "timestamp": "unix_time",
-}
-
-
-def _get_csv_to_db_map() -> dict[str, str]:
-    """
-    Merge the YAML-derived aliases with the extra hardcoded aliases.
-    Returns a lowercased-CSV-header → DB-column mapping.
-    """
-    schema = load_schema()
-    mapping = schema_to_csv_alias_map(schema)
-    # Extra aliases take lower priority (don't overwrite YAML ones)
-    for alias, db_col in _EXTRA_CSV_ALIASES.items():
-        mapping.setdefault(alias, db_col)
-    return mapping
-
-
-def _parse_target_header(line: str) -> dict:
-    """
-    Parse the metadata line at the top of a target CSV file.
-    Example: " RunNumber = 80344 - EBeam = 293.5 - SqrtS = 17.3193"
-    Returns dict with keys run_number, ebeam, sqrt_s.
-    """
-    meta = {}
-    m = re.search(r"RunNumber\s*=\s*(\d+)", line)
-    if m:
-        meta["run_number"] = int(m.group(1))
-    m = re.search(r"EBeam\s*=\s*([\d.]+)", line)
-    if m:
-        meta["ebeam"] = float(m.group(1))
-    m = re.search(r"SqrtS\s*=\s*([\d.]+)", line)
-    if m:
-        meta["sqrt_s"] = float(m.group(1))
-    return meta
-
-
-def ingest_target_file(con: duckdb.DuckDBPyConnection, filepath: str | Path) -> int:
-    """
-    Ingest one target-observable CSV file into the events table.
-
-    File format
-    -----------
-    Line 1 :  metadata   " RunNumber = XXXXX - EBeam = YYY - SqrtS = ZZZ"
-    Line 2 :  CSV header "UnixTime,q_LG,err_q_LG,..."
-    Lines 3+: CSV data   "1750091156,714.6400,1.3164,..."
-
-    Returns the number of rows inserted.
-    """
-    filepath = Path(filepath)
-    with open(filepath, "r") as f:
-        meta_line = f.readline()
-        header_line = f.readline().strip()
-        data_lines = [l.strip() for l in f if l.strip()]
-
-    meta = _parse_target_header(meta_line)
-    csv_cols = [c.strip().lower() for c in header_line.split(",")]
-    csv_to_db = _get_csv_to_db_map()
-
-    # Build the list of DB columns we will insert into
-    db_cols = []
-    csv_indices = []
-    for i, csv_col in enumerate(csv_cols):
-        db_col = csv_to_db.get(csv_col)
-        if db_col is not None:
-            db_cols.append(db_col)
-            csv_indices.append(i)
-
-    # Add the metadata columns that come from the header line
-    extra_cols = ["run_number", "ebeam", "sqrt_s"]
-    all_insert_cols = extra_cols + db_cols
-
-    placeholders = ", ".join(["?"] * len(all_insert_cols))
-    insert_sql = f"INSERT INTO events ({', '.join(all_insert_cols)}) VALUES ({placeholders})"
-
-    rows = []
-    for line in data_lines:
-        vals = line.split(",")
-        row = [
-            meta.get("run_number"),
-            meta.get("ebeam"),
-            meta.get("sqrt_s"),
-        ]
-        for idx in csv_indices:
-            row.append(float(vals[idx]))
-        rows.append(row)
-
-    con.executemany(insert_sql, rows)
-    return len(rows)
-
-
-def ingest_leadglass_file(con: duckdb.DuckDBPyConnection, filepath: str | Path) -> int:
-    """
-    Ingest one lead-glass observable file into the events table.
-
-    File format (space-separated, first line is header):
-        Nrun Nevent TimeStamp LGCharge LGChargeRMS
-        80677 10000 1762641474 688.124 52.0083
-
-    Returns the number of rows inserted.
-    """
-    filepath = Path(filepath)
-    with open(filepath, "r") as f:
-        header_line = f.readline().strip()
-        data_lines = [l.strip() for l in f if l.strip()]
-
-    csv_cols = [c.strip().lower() for c in header_line.split()]
-    csv_to_db = _get_csv_to_db_map()
-
-    db_cols = []
-    csv_indices = []
-    for i, csv_col in enumerate(csv_cols):
-        db_col = csv_to_db.get(csv_col)
-        if db_col is not None:
-            db_cols.append(db_col)
-            csv_indices.append(i)
-
-    placeholders = ", ".join(["?"] * len(db_cols))
-    insert_sql = f"INSERT INTO events ({', '.join(db_cols)}) VALUES ({placeholders})"
-
-    rows = []
-    for line in data_lines:
-        vals = line.split()
-        row = []
-        for idx in csv_indices:
-            val = vals[idx]
-            db_col = db_cols[csv_indices.index(idx)]
-            if db_col in ("run_number",):
-                row.append(int(val))
-            elif db_col == "unix_time":
-                row.append(int(val))
-            else:
-                row.append(float(val))
-        rows.append(row)
-
-    con.executemany(insert_sql, rows)
-    return len(rows)
-
-
-def ingest_all(con: duckdb.DuckDBPyConnection, base_dir: str | Path = BASE_DIR) -> None:
-    """Discover and ingest all available CSV files under base_dir."""
-    base_dir = Path(base_dir)
-
-    # Target files
-    target_dir = base_dir / "target_observables"
-    if target_dir.is_dir():
-        files = sorted(target_dir.glob("DB_run_*.txt"))
-        for f in files:
-            n = ingest_target_file(con, f)
-            print(f"  target  | {f.name:50s} | {n:>6d} rows")
-
-    # Lead-glass files
-    lg_dir = base_dir / "leadglass_observables"
-    if lg_dir.is_dir():
-        files = sorted(lg_dir.glob("*.txt"))
-        for f in files:
-            n = ingest_leadglass_file(con, f)
-            print(f"  leadgl  | {f.name:50s} | {n:>6d} rows")
+def upsert_run(con: duckdb.DuckDBPyConnection, run_number: int, **kwargs) -> None:
+    """Insert or replace a row in the runs table."""
+    kwargs["run_number"] = run_number
+    cols = ", ".join(kwargs)
+    placeholders = ", ".join(["?"] * len(kwargs))
+    con.execute(
+        f"INSERT OR REPLACE INTO runs ({cols}) VALUES ({placeholders})",
+        list(kwargs.values()),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Diagnostic / query helpers
+# tags helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def create_tag(
+    con: duckdb.DuckDBPyConnection,
+    tag_name: str,
+    description: str = "",
+    created_by: str = "",
+) -> None:
+    """Register a new tag. Silently no-ops if the tag already exists."""
+    con.execute(
+        "INSERT OR IGNORE INTO tags (tag_name, description, created_by) VALUES (?, ?, ?)",
+        [tag_name, description, created_by],
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# conditions helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def insert_condition(
+    con: duckdb.DuckDBPyConnection,
+    tag: str,
+    quantity: str,
+    value: float,
+    *,
+    detector: str | None = None,
+    uncertainty: float | None = None,
+    unit: str | None = None,
+    since_run: int | None = None,
+    until_run: int | None = None,
+    valid_since=None,
+    valid_until=None,
+    source_file: str | None = None,
+    notes: str | None = None,
+) -> int:
+    """
+    Insert one condition row. Returns the new condition_id.
+
+    Example
+    -------
+    insert_condition(con, tag="reprocessing_2025v1",
+                     detector="leadglass", quantity="charge_calib",
+                     value=1.042, uncertainty=0.003, unit="a.u.",
+                     since_run=80000, until_run=81000)
+    """
+    row = {
+        "tag": tag,
+        "detector": detector,
+        "quantity": quantity,
+        "value": value,
+        "uncertainty": uncertainty,
+        "unit": unit,
+        "since_run": since_run,
+        "until_run": until_run,
+        "valid_since": valid_since,
+        "valid_until": valid_until,
+        "source_file": source_file,
+        "notes": notes,
+    }
+    row = {k: v for k, v in row.items() if v is not None}
+    cols = ", ".join(row)
+    placeholders = ", ".join(["?"] * len(row))
+    result = con.execute(
+        f"INSERT INTO conditions ({cols}) VALUES ({placeholders}) RETURNING condition_id",
+        list(row.values()),
+    ).fetchone()
+    return result[0]
+
+
+def get_conditions(
+    con: duckdb.DuckDBPyConnection,
+    run_number: int,
+    tag: str,
+    detector: str | None = None,
+    quantity: str | None = None,
+) -> list[dict]:
+    """
+    Return all conditions valid for run_number under tag.
+    Optionally narrow by detector and/or quantity.
+
+    A condition row is valid for run_number when:
+        since_run <= run_number AND (until_run IS NULL OR until_run >= run_number)
+    """
+    filters = ["tag = ?", "since_run <= ?", "(until_run IS NULL OR until_run >= ?)"]
+    params: list = [tag, run_number, run_number]
+
+    if detector:
+        filters.append("detector = ?")
+        params.append(detector)
+    if quantity:
+        filters.append("quantity = ?")
+        params.append(quantity)
+
+    rows = con.execute(
+        f"SELECT * FROM conditions WHERE {' AND '.join(filters)} "
+        "ORDER BY detector, quantity",
+        params,
+    ).fetchall()
+    col_names = [d[0] for d in con.description]
+    return [dict(zip(col_names, r)) for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# monitoring helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def insert_monitoring_rows(
+    con: duckdb.DuckDBPyConnection,
+    rows: list[dict],
+) -> int:
+    """
+    Bulk-insert monitoring rows.  Each dict must have at minimum:
+        run_number, unix_time, detector, quantity, value
+
+    Returns the number of rows inserted.
+    """
+    if not rows:
+        return 0
+    cols = list(rows[0].keys())
+    placeholders = ", ".join(["?"] * len(cols))
+    data = [[r[c] for c in cols] for r in rows]
+    con.executemany(
+        f"INSERT INTO monitoring ({', '.join(cols)}) VALUES ({placeholders})",
+        data,
+    )
+    return len(data)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Diagnostics
 # ──────────────────────────────────────────────────────────────────────
 
 def print_summary(con: duckdb.DuckDBPyConnection) -> None:
-    """Print a quick summary of the database contents."""
-    total = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    runs  = con.execute("SELECT COUNT(DISTINCT run_number) FROM events").fetchone()[0]
-    cols  = con.execute(
-        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='events'"
-    ).fetchone()[0]
+    def n(table):
+        return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
-    print(f"\n{'='*60}")
-    print(f"  PADME Conditions DB  —  {DB_FILE}")
-    print(f"{'='*60}")
-    print(f"  Total rows:        {total:>12,}")
-    print(f"  Distinct runs:     {runs:>12,}")
-    print(f"  Columns:           {cols:>12,}")
+    sep = "=" * 64
+    print(f"\n{sep}")
+    print("  PADME Conditions DB")
+    print(sep)
+    print(f"  {'runs':<20} {n('runs'):>10,} rows")
+    print(f"  {'tags':<20} {n('tags'):>10,} rows")
+    print(f"  {'conditions':<20} {n('conditions'):>10,} rows")
+    print(f"  {'monitoring':<20} {n('monitoring'):>10,} rows")
     print()
 
-    # Per-run breakdown
-    print("  Run-level breakdown:")
-    rows = con.execute("""
-        SELECT run_number,
-               COUNT(*) AS n_rows,
-               MIN(unix_time) AS t_start,
-               MAX(unix_time) AS t_end,
-               AVG(ebeam) AS avg_ebeam
-        FROM events
-        GROUP BY run_number
-        ORDER BY run_number
-    """).fetchall()
-    for r in rows:
-        ebeam_str = f"{r[4]:.1f}" if r[4] is not None else "N/A"
-        print(f"    run {r[0]:>7d}  |  {r[1]:>5d} rows  |  "
-              f"t=[{r[2]}..{r[3]}]  |  EBeam={ebeam_str}")
-    print()
-
-    # Column listing
-    print("  Column listing:")
-    col_rows = con.execute(
-        "SELECT column_name, data_type FROM information_schema.columns "
-        "WHERE table_name='events' ORDER BY ordinal_position"
+    tags = con.execute(
+        "SELECT tag_name, description, created_at FROM tags ORDER BY created_at"
     ).fetchall()
-    for cname, ctype in col_rows:
-        print(f"    {cname:45s}  {ctype}")
-    print()
+    if tags:
+        print("  Tags:")
+        for tag_name, desc, ts in tags:
+            print(f"    {tag_name:30s}  {desc or '':40s}  {ts or ''}")
+        print()
+
+    runs = con.execute(
+        "SELECT run_number, run_type, start_time, ebeam_nominal, is_good "
+        "FROM runs ORDER BY run_number"
+    ).fetchall()
+    if runs:
+        print("  Runs:")
+        for run_number, rtype, t_start, ebeam, good in runs:
+            quality = "OK " if good else "BAD"
+            e_str = f"{ebeam:.1f} MeV" if ebeam else "?"
+            print(f"    {run_number:>8d}  {str(rtype or ''):15s}  "
+                  f"{e_str:12s}  [{quality}]  {t_start or ''}")
+        print()
+
+    cond_groups = con.execute("""
+        SELECT tag, detector, quantity, COUNT(*) AS n_iov
+        FROM conditions
+        GROUP BY tag, detector, quantity
+        ORDER BY tag, detector, quantity
+    """).fetchall()
+    if cond_groups:
+        print("  Conditions (tag / detector / quantity / #IoVs):")
+        for tag, det, qty, n_iov in cond_groups:
+            print(f"    {str(tag):25s}  {str(det or '?'):15s}  "
+                  f"{str(qty):35s}  {n_iov} IoV(s)")
+        print()
 
 
 def interactive_shell(db_path: str | Path = DB_FILE) -> None:
-    """Drop into an interactive DuckDB SQL shell."""
     print(f"\nOpening DuckDB shell on {db_path} …")
     print("Type SQL queries, or .exit / Ctrl-D to quit.\n")
     con = duckdb.connect(str(db_path), read_only=True)
@@ -351,8 +323,7 @@ def interactive_shell(db_path: str | Path = DB_FILE) -> None:
             if not query or query.lower() in (".exit", "exit", "quit"):
                 break
             try:
-                result = con.execute(query)
-                print(result.fetchdf().to_string())
+                print(con.execute(query).fetchdf().to_string())
             except Exception as e:
                 print(f"ERROR: {e}")
     finally:
@@ -360,7 +331,7 @@ def interactive_shell(db_path: str | Path = DB_FILE) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# CLI entry point
+# CLI
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -368,31 +339,32 @@ def main():
         description="PADME Conditions Database manager (DuckDB)"
     )
     parser.add_argument("--build", action="store_true",
-                        help="(Re)create the DB and ingest all example CSV files")
-    parser.add_argument("--shell", action="store_true",
-                        help="Open an interactive SQL shell on the DB")
+                        help="Create / migrate tables from schema.yaml")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Delete the DB file before --build (full rebuild)")
     parser.add_argument("--check", action="store_true",
-                        help="Print a summary / sanity check of the DB")
-    parser.add_argument("--db", type=str, default=DB_FILE,
+                        help="Print a summary of the DB contents")
+    parser.add_argument("--shell", action="store_true",
+                        help="Open an interactive SQL shell")
+    parser.add_argument("--db", default=DB_FILE,
                         help=f"Path to the DuckDB file (default: {DB_FILE})")
     args = parser.parse_args()
 
-    if not any([args.build, args.shell, args.check]):
+    if not any([args.build, args.check, args.shell]):
         parser.print_help()
         sys.exit(0)
 
     if args.build:
         db_path = Path(args.db)
-        if db_path.exists():
+        if args.fresh and db_path.exists():
             db_path.unlink()
-            print(f"Removed existing {db_path}")
-        con = create_database(db_path)
-        print("Ingesting data …")
-        ingest_all(con)
+            print(f"Removed {db_path}")
+        print(f"Building {db_path} …")
+        con = open_db(db_path)
         print_summary(con)
         con.close()
         size_mb = db_path.stat().st_size / 1024 / 1024
-        print(f"Database written to {db_path}  ({size_mb:.2f} MB)\n")
+        print(f"Done. {db_path}  ({size_mb:.3f} MB)\n")
 
     if args.check:
         con = duckdb.connect(str(args.db), read_only=True)

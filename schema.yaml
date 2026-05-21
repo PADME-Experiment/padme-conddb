@@ -2,164 +2,198 @@
 # PADME Conditions Database — Schema Definition
 # ======================================================================
 #
-# This file is the single source of truth for every column in the DB.
-# Edit it by hand to add/remove/rename columns, then rebuild the DB:
+# Four tables:
 #
-#     python padme_conditions_db.py --build
+#   runs        — one row per run, immutable metadata
+#   tags        — named condition snapshots (like "global tags" in CMS/ATLAS)
+#   conditions  — IoV-scoped, versioned scalar conditions
+#   monitoring  — dense time-series observables within a run (EAV layout)
 #
-# Structure
-# ---------
-# Each top-level key is a "detector group" (shown as a group in the web UI).
-# Under each group, list the columns with their SQL type and an optional
-# description.  The special group "core" holds event identifiers and
-# run-level metadata.
+# Edit this file and run `python padme_conditions_db.py --build` to apply.
 #
-# Supported SQL types: INTEGER, BIGINT, DOUBLE, VARCHAR, BOOLEAN, …
-# Add "NOT NULL" after the type if the column must always have a value.
-#
-# Column names should be lowercase with underscores (snake_case).
-#
-# The optional "csv_alias" field maps a raw CSV header name (lowercased)
-# to this DB column, used during ingestion.  If omitted the DB column
-# name is used as-is for matching.
+# Per-column fields
+# -----------------
+#   type          DuckDB SQL type; append NOT NULL here if needed
+#   primary_key   true → part of the table's PRIMARY KEY
+#   auto_increment true → backed by a SEQUENCE (INTEGER columns only)
+#   default       SQL default expression, e.g. "current_timestamp"
+#   index         true → CREATE INDEX on this column
+#   fk            "other_table.column" → FOREIGN KEY
+#   description   documentation (not written to DB)
 # ======================================================================
 
-core:
-  run_number:
-    type: "INTEGER NOT NULL"
-    description: "Run number"
-  unix_time:
-    type: "BIGINT NOT NULL"
-    description: "Unix timestamp [seconds] — primary key / unique ID"
-  ebeam:
-    type: "DOUBLE"
-    description: "Beam energy [MeV]"
-  sqrt_s:
-    type: "DOUBLE"
-    description: "Centre-of-mass energy [MeV]"
+tables:
 
-target_charges:
-  q_lg:
-    type: "DOUBLE"
-    description: "Lead-glass charge (from target reco)"
-  err_q_lg:
-    type: "DOUBLE"
-    description: "Error on q_lg"
-  qx_target:
-    type: "DOUBLE"
-    description: "Target charge — X strips"
-  err_qx_target:
-    type: "DOUBLE"
-    description: "Error on qx_target"
-  qy_target:
-    type: "DOUBLE"
-    description: "Target charge — Y strips"
-  err_qy_target:
-    type: "DOUBLE"
-    description: "Error on qy_target"
-  fitted_qx_target:
-    type: "DOUBLE"
-    description: "Fitted target charge — X strips"
-  err_fitted_qx_target:
-    type: "DOUBLE"
-    description: "Error on fitted_qx_target"
-  fitted_qy_target:
-    type: "DOUBLE"
-    description: "Fitted target charge — Y strips"
-  err_fitted_qy_target:
-    type: "DOUBLE"
-    description: "Error on fitted_qy_target"
+  # --------------------------------------------------------------------
+  # runs — immutable per-run metadata
+  # --------------------------------------------------------------------
+  runs:
+    description: "One row per run. Written once at run start; never updated."
+    columns:
+      run_number:
+        type: INTEGER
+        primary_key: true
+        description: "Run number — unique identifier"
+      run_type:
+        type: VARCHAR
+        description: "production | calibration | cosmic | test | noise"
+      start_time:
+        type: TIMESTAMPTZ
+        description: "Run start (wall-clock)"
+      end_time:
+        type: TIMESTAMPTZ
+        description: "Run end (wall-clock); NULL if run is still ongoing"
+      ebeam_nominal:
+        type: DOUBLE
+        description: "Nominal beam energy [MeV]"
+      sqrt_s_nominal:
+        type: DOUBLE
+        description: "Nominal centre-of-mass energy [MeV]"
+      is_good:
+        type: BOOLEAN
+        default: "true"
+        description: "Data-quality flag; false = excluded from physics analysis"
+      notes:
+        type: VARCHAR
+        description: "Free-text shifter comments or known issues"
 
-target_ratios:
-  ratio_qx_target_lg:
-    type: "DOUBLE"
-    description: "qX_Target / q_LG"
-  err_ratio_qx_target_lg:
-    type: "DOUBLE"
-    description: "Error on ratio_qx_target_lg"
-  ratio_qy_target_lg:
-    type: "DOUBLE"
-    description: "qY_Target / q_LG"
-  err_ratio_qy_target_lg:
-    type: "DOUBLE"
-    description: "Error on ratio_qy_target_lg"
-  ratio_fitted_qx_target_lg:
-    type: "DOUBLE"
-    description: "Fitted_qX_Target / q_LG"
-  err_ratio_fitted_qx_target_lg:
-    type: "DOUBLE"
-    description: "Error on ratio_fitted_qx_target_lg"
-  ratio_fitted_qy_target_lg:
-    type: "DOUBLE"
-    description: "Fitted_qY_Target / q_LG"
-  err_ratio_fitted_qy_target_lg:
-    type: "DOUBLE"
-    description: "Error on ratio_fitted_qy_target_lg"
+  # --------------------------------------------------------------------
+  # tags — named condition snapshots
+  #
+  # A tag groups a self-consistent set of conditions for one processing
+  # campaign.  Query conditions with a specific tag to get a reproducible
+  # view of the detector state, even after recalibration.
+  #
+  # Examples: "online_v1", "reprocessing_2025v1", "mc_alignment_v3"
+  # --------------------------------------------------------------------
+  tags:
+    description: "Named condition snapshots — use one tag per processing campaign."
+    columns:
+      tag_name:
+        type: VARCHAR
+        primary_key: true
+        description: "Short unique label, e.g. 'reprocessing_2025v1'"
+      description:
+        type: VARCHAR
+        description: "Human-readable purpose of this tag"
+      created_at:
+        type: TIMESTAMPTZ
+        default: "current_timestamp"
+        description: "When this tag was registered"
+      created_by:
+        type: VARCHAR
+        description: "Username or process that created the tag"
 
-target_ratios_encorr:
-  ratio_qx_target_lg_encorr:
-    type: "DOUBLE"
-    description: "qX_Target / q_LG (energy-corrected)"
-  err_ratio_qx_target_lg_encorr:
-    type: "DOUBLE"
-    description: "Error on ratio_qx_target_lg_encorr"
-  ratio_qy_target_lg_encorr:
-    type: "DOUBLE"
-    description: "qY_Target / q_LG (energy-corrected)"
-  err_ratio_qy_target_lg_encorr:
-    type: "DOUBLE"
-    description: "Error on ratio_qy_target_lg_encorr"
-  ratio_fitted_qx_target_lg_encorr:
-    type: "DOUBLE"
-    description: "Fitted_qX_Target / q_LG (energy-corrected)"
-  err_ratio_fitted_qx_target_lg_encorr:
-    type: "DOUBLE"
-    description: "Error on ratio_fitted_qx_target_lg_encorr"
-  ratio_fitted_qy_target_lg_encorr:
-    type: "DOUBLE"
-    description: "Fitted_qY_Target / q_LG (energy-corrected)"
-  err_ratio_fitted_qy_target_lg_encorr:
-    type: "DOUBLE"
-    description: "Error on ratio_fitted_qy_target_lg_encorr"
+  # --------------------------------------------------------------------
+  # conditions — versioned, IoV-scoped scalar conditions
+  #
+  # Each row is one (quantity, value ± uncertainty) valid over a run range
+  # and/or a wall-clock range, belonging to a named tag.
+  #
+  # Typical query:
+  #   SELECT * FROM conditions
+  #   WHERE tag = 'reprocessing_2025v1'
+  #     AND quantity = 'charge_calib'
+  #     AND since_run <= 80500
+  #     AND (until_run IS NULL OR until_run >= 80500)
+  #
+  # until_run IS NULL means the condition is open-ended (still current).
+  # --------------------------------------------------------------------
+  conditions:
+    description: "Core IoV table — one row per condition interval."
+    columns:
+      condition_id:
+        type: INTEGER
+        primary_key: true
+        auto_increment: true
+        description: "Surrogate key"
+      tag:
+        type: "VARCHAR NOT NULL"
+        index: true
+        fk: "tags.tag_name"
+        description: "Tag this condition belongs to"
+      detector:
+        type: VARCHAR
+        index: true
+        description: "Sub-detector: leadglass | target | ecal | pveto | eveto | sac | trigger"
+      quantity:
+        type: "VARCHAR NOT NULL"
+        index: true
+        description: "Quantity name, e.g. 'charge_calib', 'beam_x', 'threshold_mv'"
+      value:
+        type: DOUBLE
+        description: "Central value"
+      uncertainty:
+        type: DOUBLE
+        description: "1-sigma uncertainty (NULL if not applicable)"
+      unit:
+        type: VARCHAR
+        description: "Physical unit string, e.g. 'pC', 'mm', 'MeV'"
+      since_run:
+        type: INTEGER
+        index: true
+        description: "First run for which this condition is valid (inclusive)"
+      until_run:
+        type: INTEGER
+        index: true
+        description: "Last valid run (inclusive); NULL = open-ended"
+      valid_since:
+        type: TIMESTAMPTZ
+        description: "Wall-clock start of validity (complement to run-based IoV)"
+      valid_until:
+        type: TIMESTAMPTZ
+        description: "Wall-clock end of validity; NULL = still current"
+      source_file:
+        type: VARCHAR
+        description: "File or process that produced this condition"
+      created_at:
+        type: TIMESTAMPTZ
+        default: "current_timestamp"
+        description: "Row insertion timestamp"
+      notes:
+        type: VARCHAR
+        description: "Free-text provenance notes"
 
-target_positions:
-  x_tar:
-    type: "DOUBLE"
-    description: "Beam X position on target [mm]"
-  err_x_tar:
-    type: "DOUBLE"
-    description: "Error on x_tar"
-  y_tar:
-    type: "DOUBLE"
-    description: "Beam Y position on target [mm]"
-  err_y_tar:
-    type: "DOUBLE"
-    description: "Error on y_tar"
-  fitted_x_tar:
-    type: "DOUBLE"
-    description: "Fitted beam X position [mm]"
-  err_fitted_x_tar:
-    type: "DOUBLE"
-    description: "Error on fitted_x_tar"
-  fitted_y_tar:
-    type: "DOUBLE"
-    description: "Fitted beam Y position [mm]"
-  err_fitted_y_tar:
-    type: "DOUBLE"
-    description: "Error on fitted_y_tar"
-  sigmax_tar:
-    type: "DOUBLE"
-    description: "Beam sigma X on target [mm]"
-  err_sigmax_tar:
-    type: "DOUBLE"
-    description: "Error on sigmax_tar"
-
-leadglass:
-  lg_charge:
-    type: "DOUBLE"
-    description: "Lead-glass calorimeter total charge"
-    csv_alias: "lgcharge"
-  lg_charge_rms:
-    type: "DOUBLE"
-    description: "RMS of lead-glass charge"
-    csv_alias: "lgchargerms"
+  # --------------------------------------------------------------------
+  # monitoring — dense per-run time-series (EAV layout)
+  #
+  # Stores high-cadence observables: one row per (run, time-slice,
+  # detector, quantity).  EAV keeps this table detector-agnostic — new
+  # sub-detectors are added by ingesting new (detector, quantity) pairs
+  # without any schema change.
+  #
+  # For wide-table access patterns, use a pivot view:
+  #   PIVOT (SELECT * FROM monitoring WHERE detector='leadglass')
+  #   ON quantity USING first(value)
+  # --------------------------------------------------------------------
+  monitoring:
+    description: "Dense time-series observables; one row per quantity per time slice."
+    columns:
+      run_number:
+        type: "INTEGER NOT NULL"
+        index: true
+        fk: "runs.run_number"
+        description: "Run number"
+      unix_time:
+        type: "BIGINT NOT NULL"
+        index: true
+        description: "Unix timestamp of the time slice [seconds]"
+      detector:
+        type: "VARCHAR NOT NULL"
+        index: true
+        description: "Sub-detector label"
+      quantity:
+        type: "VARCHAR NOT NULL"
+        description: "Observable name"
+      value:
+        type: DOUBLE
+        description: "Measured value"
+      uncertainty:
+        type: DOUBLE
+        description: "1-sigma uncertainty"
+      n_events:
+        type: INTEGER
+        description: "Number of events accumulated in this time slice"
+      source_file:
+        type: VARCHAR
+        description: "Source file this row was ingested from"
